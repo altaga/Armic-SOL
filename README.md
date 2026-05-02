@@ -1,5 +1,7 @@
 # Armic: Autonomous Rehabilitation via Solana-Powered AI Agents
 
+https://kickstart.easya.io/token/DcTVUogWykX1JeBmTq48Fzj2Lc3Y7zwHQS1CyZ9SHnXf
+
 ![Armic Header](./Images/logo.jpg)
 
 > **ARMIC turns rehabilitation into an autonomous, measurable, and incentivized system powered by AI agents.**
