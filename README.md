@@ -1,14 +1,52 @@
 # Armic: Autonomous Rehabilitation via Solana-Powered AI Agents
 
-https://kickstart.easya.io/token/DcTVUogWykX1JeBmTq48Fzj2Lc3Y7zwHQS1CyZ9SHnXf
-
 ![Armic Header](./Images/logo.jpg)
 
 > **ARMIC turns rehabilitation into an autonomous, measurable, and incentivized system powered by AI agents.**
 
 ---
 
-## 🛑 Rehabilitation is Broken
+## 🔥 Huge Edge Detection Upgrade
+We’ve made a major improvement to our on-device “edge detection” pipeline: ARMIC now runs **Edge Impulse inference directly on the device** and publishes the classification result over MQTT.
+
+What this unlocks:
+- **Real-time exercise classification at the edge** using **6-axis sensor fusion** (accX/accY/accZ + gyrX/gyrY/gyrZ) sampled at **50 Hz**
+- **4-class output**: Baseline / Bicepcurl / Elbowflexion / Lateralraise
+- **MQTT JSON publishing** of the top label + per-class scores, enabling downstream apps/agents to subscribe to clean, ready-to-use predictions
+
+### Where the Edge Inference Runs
+- Sketch: `DNN-Testing/sketch.ino`
+- Device: M5Stack Core2 (ESP32) + MPU6886 IMU
+- Sampling: 50 Hz, 6-axis fusion (accelerometer + gyroscope)
+- Output: continuous classification + periodic MQTT publish
+
+### MQTT Result Payload
+Published topic:
+- `armic/inference/result`
+
+Example message:
+```json
+{
+  "label": "Bicepcurl",
+  "score": 0.8542,
+  "scores": {
+    "Baseline": 0.0123,
+    "Bicepcurl": 0.8542,
+    "Elbowflexion": 0.1021,
+    "Lateralraise": 0.0314
+  },
+  "timing": { "dsp": 8, "classification": 3, "anomaly": 0 }
+}
+```
+
+### Running It Locally
+To point the device at your WiFi + broker, update these constants in `DNN-Testing/sketch.ino`:
+- `WIFI_SSID`, `WIFI_PASSWORD`
+- `MQTT_BROKER` (IP/hostname of your local broker)
+
+---
+
+## � Rehabilitation is Broken
 Rehabilitation today is **manual, inconsistent, and difficult to track**. 
 - **Patients drop out** before completing therapy.
 - **Progress is rarely measurable.**
@@ -79,8 +117,17 @@ ARMIC introduces a tokenized incentive system. Patients earn **$ARMIC** by compl
 - **Autonomy**: AI agents automatically distribute rewards based on verified performance.
 - **Alignment**: Incentivizes engagement for patients and efficiency for providers.
 
+### EasyA Kickstart Token
+Follow the token on EasyA Kickstart:
+- https://kickstart.easya.io/token/DcTVUogWykX1JeBmTq48Fzj2Lc3Y7zwHQS1CyZ9SHnXf
+
 ### Token Contract (Solana)
 *Mainnet Address:* `Coming Soon...`
+
+---
+
+## 🦾 Arm Hardware
+Coming soon
 
 ---
 

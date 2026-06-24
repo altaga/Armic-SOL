@@ -1,145 +1,345 @@
-#include "creds.h"
-#include "MQTTManager.h"
-#include <ArduinoJson.h>
+/*
+ * Armic Edge Impulse inference on M5Stack Core2, with MQTT publishing
+ * of the classification result.
+ *
+ * The deployed Edge Impulse model (Armic) is a sensor-fusion classifier
+ * over 6 axes (accX + accY + accZ + gyrX + gyrY + gyrZ) sampled at
+ * 50 Hz. It outputs 4 classes: Baseline / Bicepcurl / Elbowflexion /
+ * Lateralraise. This sketch streams samples from the onboard MPU6886
+ * IMU into the Armic inference library, prints the predictions, and
+ * publishes a JSON payload with the top label and per-class scores
+ * to the same broker used by the MotionCapture project.
+ */
+
+#include <Arduino.h>
+#include <M5Core2.h>
+#include <WiFi.h>
+#include "mqtt_client.h"
 #include <Armic_inferencing.h>
 
-// --- Configuration ---
-#define DATA_SIZE 900
-const char* PUBLISH_TOPIC = "/armic/imu-1/output";
-const char* SUBSCRIBE_TOPIC = "/armic/imu-1/input";
+/* Constant defines -------------------------------------------------------- */
+#define CONVERT_G_TO_MS2     9.80665f
+#define MAX_ACCEPTED_RANGE   2.0f    // Model was trained on accel clamped to +-2g
+#define EI_SENSOR_AIXS_COUNT 6
 
-String unique_client_id;
+/* MQTT topic on the local broker. MotionCapture uses armic/kinematics/stream
+ * for raw samples; this device publishes classification results on a
+ * separate topic so a downstream consumer can subscribe to either.
+ */
+#define MQTT_TOPIC_RESULT    "armic/inference/result"
 
-// --- Memory & Buffers ---
-float features[DATA_SIZE];
-float featuresMemory[DATA_SIZE];
-volatile int counter = 0;
-volatile bool flag = false;
+/* --- Network configuration (matches MotionCapture) --------------------- */
+static const char* WIFI_SSID     = "";
+static const char* WIFI_PASSWORD = "";
+static const char* MQTT_BROKER   = ""; 
+static const char* MQTT_CLIENT_ID = "ArmicInferenceNode";
 
-// --- Prototypes ---
-int raw_feature_get_data(size_t offset, size_t length, float* out_ptr);
+/* --- MQTT state --------------------------------------------------------- */
+static esp_mqtt_client_handle_t mqttClient;
+static volatile bool mqtt_connected = false;
 
-// --- Incoming MQTT Message Handler ---
-void onMessageReceived(String topic, String payload) {
-  if (topic == SUBSCRIBE_TOPIC) {
-    Serial.println("Message arrived [" + topic + "]: " + payload);
-    // Add any logic here you want to trigger when you receive a message
-  }
-}
+/* --- 6-Axis Sensor Variables -------------------------------------------- */
+static float data[EI_SENSOR_AIXS_COUNT]; // [accX, accY, accZ, gyrX, gyrY, gyrZ]
+static const bool debug_nn = false;
 
-// --- Subscription Handler ---
-void onMqttConnected() {
-  mqttSubscribe(SUBSCRIBE_TOPIC);
-}
+/* --- Publish payload buffer (pre-allocated, no heap in hot path) -------- */
+static char mqttPayload[512];
 
+/* Forward declarations --------------------------------------------------- */
+static bool read_imu(float *out);
+static void run_inference(void);
+static void setup_wifi(void);
+static void mqtt_event_handler(void* handler_args, esp_event_base_t base,
+                               int32_t event_id, void* event_data);
+static void publish_inference_result(const ei_impulse_result_t *result);
+
+/* ------------------------------------------------------------------------ */
 void setup() {
-  Serial.begin(115200);
-  Serial.println("Armic Multi-Thread ML over Secure WebSockets");
+    M5.begin();
+    M5.Lcd.setTextSize(2);
 
-  // 1. Setup Unique ID
-  uint64_t chipid = ESP.getEfuseMac();
-  uint32_t lower32 = (uint32_t)chipid;
-  uint16_t upper16 = (uint16_t)(chipid >> 32);
-  char idBuff[30];
-  snprintf(idBuff, sizeof(idBuff), "%s%04X%08X", client_base_name, upper16, lower32);
-  unique_client_id = String(idBuff);
+    if (M5.IMU.Init() != 0) {
+        M5.Lcd.setCursor(10, 10);
+        M5.Lcd.setTextColor(RED, BLACK);
+        M5.Lcd.println("IMU INIT FAIL");
+        while (1) { delay(1000); }
+    }
 
-  // 2. Configure MQTT Callbacks & Connect
-  setMqttCallback(onMessageReceived);
-  setMqttConnectCallback(onMqttConnected);
-  
-  wifiConnect(ssid, password);
-  mqttConnect(host, mqtt_user, mqtt_pass, unique_client_id.c_str());
+    // The Edge Impulse "Armic" model was trained on accel data clamped to
+    // +-2 g, so configure the MPU6886 in that range for best fidelity.
+    M5.IMU.SetAccelFsr(MPU6886::AFS_2G);
 
-  // 3. Start the Hardware Collection Task on Core 1
-  xTaskCreatePinnedToCore(
-    TaskAccelerator,    // Function to implement the task
-    "TaskAccelerator",  // Name of the task
-    4096,               // Stack size in words
-    NULL,               // Task input parameter
-    1,                  // Priority of the task
-    NULL,               // Task handle
-    1                   // Core where the task should run
-  );
+    Serial.begin(115200);
+    Serial.println();
+    Serial.println("=== Armic Edge Impulse + MQTT ===");
+
+    ei_printf("Inferencing settings:\n");
+    ei_printf("\tInterval: %.2f ms.\n", (float)EI_CLASSIFIER_INTERVAL_MS);
+    ei_printf("\tFrame size: %d\n", EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE);
+    ei_printf("\tSample length: %d ms.\n", EI_CLASSIFIER_RAW_SAMPLE_COUNT / 16);
+    ei_printf("\tNo. of classes: %d\n",
+              sizeof(ei_classifier_inferencing_categories) / sizeof(ei_classifier_inferencing_categories[0]));
+
+    // Throw away the first few samples so the IMU settles.
+    for (int i = 0; i < 10; i++) {
+        read_imu(data);
+        delay(10);
+    }
+
+    setup_wifi();
+
+    // Plain TCP, no TLS — broker is on the local LAN at 192.168.1.168:1883.
+    char uri[64];
+    snprintf(uri, sizeof(uri), "mqtt://%s:1883", MQTT_BROKER);
+    Serial.printf("MQTT: starting client -> %s\n", uri);
+
+    esp_mqtt_client_config_t mqtt_cfg = {};
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+    mqtt_cfg.broker.address.uri    = uri;
+    mqtt_cfg.credentials.client_id = MQTT_CLIENT_ID;
+    mqtt_cfg.session.keepalive     = 30;
+    mqtt_cfg.buffer.size           = sizeof(mqttPayload);
+#else
+    mqtt_cfg.uri         = uri;
+    mqtt_cfg.client_id   = MQTT_CLIENT_ID;
+    mqtt_cfg.keepalive   = 30;
+    mqtt_cfg.buffer_size = sizeof(mqttPayload);
+#endif
+
+    mqttClient = esp_mqtt_client_init(&mqtt_cfg);
+    esp_mqtt_client_register_event(mqttClient, MQTT_EVENT_ANY, mqtt_event_handler, NULL);
+    esp_mqtt_client_start(mqttClient);
 }
 
+/* ------------------------------------------------------------------------ */
 void loop() {
-  // The main loop handles the heavy ML processing whenever data is ready
-  if (flag) {
-    ei_printf("Edge Impulse standalone inferencing (Arduino)\n");
-    
+    // Inference runs whether or not MQTT is up. The publish step no-ops
+    // while the client is disconnected; ESP-IDF MQTT auto-reconnects in
+    // its own task.
+    run_inference();
+}
+
+/**
+ * Read a fresh 6-axis sample from the MPU6886.
+ *
+ * Accelerometer: reported in g by the MPU6886 -> convert to m/s^2 for the
+ * Edge Impulse model. Saturate to +-2g before scaling.
+ *
+ * Gyroscope: already reported in degrees/s, which matches the model.
+ */
+static bool read_imu(float *out) {
+    float ax, ay, az;
+    float gx, gy, gz;
+
+    M5.IMU.getAccelData(&ax, &ay, &az);
+    M5.IMU.getGyroData(&gx, &gy, &gz);
+
+    // Belt-and-braces clamp: the MPU6886 is already in +-2g mode.
+    if (ax >  MAX_ACCEPTED_RANGE) ax =  MAX_ACCEPTED_RANGE;
+    if (ax < -MAX_ACCEPTED_RANGE) ax = -MAX_ACCEPTED_RANGE;
+    if (ay >  MAX_ACCEPTED_RANGE) ay =  MAX_ACCEPTED_RANGE;
+    if (ay < -MAX_ACCEPTED_RANGE) ay = -MAX_ACCEPTED_RANGE;
+    if (az >  MAX_ACCEPTED_RANGE) az =  MAX_ACCEPTED_RANGE;
+    if (az < -MAX_ACCEPTED_RANGE) az = -MAX_ACCEPTED_RANGE;
+
+    out[0] = ax * CONVERT_G_TO_MS2; // accX (m/s^2)
+    out[1] = ay * CONVERT_G_TO_MS2; // accY (m/s^2)
+    out[2] = az * CONVERT_G_TO_MS2; // accZ (m/s^2)
+    out[3] = gx;                    // gyrX (deg/s)
+    out[4] = gy;                    // gyrY (deg/s)
+    out[5] = gz;                    // gyrZ (deg/s)
+    return true;
+}
+
+/**
+ * Collect EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE raw samples at
+ * EI_CLASSIFIER_INTERVAL_MS intervals and run the classifier.
+ */
+static void run_inference(void) {
+    float buffer[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE] = { 0 };
+
+    for (size_t ix = 0; ix < EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE; ix += EI_SENSOR_AIXS_COUNT) {
+        int64_t next_tick = (int64_t)micros() + ((int64_t)(1000.0f / EI_CLASSIFIER_FREQUENCY) * 1000);
+
+        if (!read_imu(data)) {
+            ei_printf("ERR: failed to read IMU, skipping inference\n");
+            return;
+        }
+        for (int i = 0; i < EI_SENSOR_AIXS_COUNT; i++) {
+            buffer[ix + i] = data[i];
+        }
+
+        int64_t wait_time = next_tick - (int64_t)micros();
+        if (wait_time > 0) {
+            delayMicroseconds(wait_time);
+        }
+    }
+
+    signal_t signal;
+    int err = numpy::signal_from_buffer(buffer, EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE, &signal);
+    if (err != 0) {
+        ei_printf("ERR: signal_from_buffer failed (%d)\n", err);
+        return;
+    }
+
     ei_impulse_result_t result = { 0 };
-    signal_t features_signal;
-    features_signal.total_length = sizeof(features) / sizeof(features[0]);
-    features_signal.get_data = &raw_feature_get_data;
-    
-    // Run the classifier
-    EI_IMPULSE_ERROR res = run_classifier(&features_signal, &result, false);
-    if (res != EI_IMPULSE_OK) {
-      ei_printf("ERR: Failed to run classifier (%d)\n", res);
-      flag = false; // Reset flag to try again next time
-      return;
-    }
-    
-    // Find the highest confidence prediction
-    float max_v = 0;
-    int max_i = 0;
-    for (uint16_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
-      if (result.classification[i].value > max_v) {
-        max_v = result.classification[i].value;
-        max_i = i;
-      }
-      ei_printf("  %s: %.5f\r\n", ei_classifier_inferencing_categories[i], result.classification[i].value);
-    }
-    
-    // Package and send the best result via MQTT if connected
-    if (current_state == STATE_CONNECTED) {
-      JsonDocument doc;
-      
-      // Creates a clean JSON output like: {"normal": 0.98}
-      doc[ei_classifier_inferencing_categories[max_i]] = max_v;
-      
-      mqttPublish(PUBLISH_TOPIC, doc);
+    err = run_classifier(&signal, &result, debug_nn);
+    if (err != EI_IMPULSE_OK) {
+        ei_printf("ERR: run_classifier failed (%d)\n", err);
+        return;
     }
 
-    flag = false;
-  }
+    ei_printf("Predictions (DSP: %d ms., Classification: %d ms., Anomaly: %d ms.):\n",
+              result.timing.dsp, result.timing.classification, result.timing.anomaly);
+    for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
+        ei_printf("    %s: ", result.classification[ix].label);
+        ei_printf_float(result.classification[ix].value);
+        ei_printf("\n");
+    }
+#if EI_CLASSIFIER_HAS_ANOMALY == 1
+    ei_printf("    anomaly score: ");
+    ei_printf_float(result.anomaly);
+    ei_printf("\n");
+#endif
 
-  // Yield to FreeRTOS background tasks (like MQTT!)
-  vTaskDelay(pdMS_TO_TICKS(10));
+    publish_inference_result(&result);
 }
 
-/*--------------------------------------------------*/
-/*---------------------- Tasks ---------------------*/
-/*--------------------------------------------------*/
+/* ------------------------------------------------------------------------ */
+/* WiFi + MQTT                                                              */
+/* ------------------------------------------------------------------------ */
+static void setup_wifi(void) {
+    M5.Lcd.setCursor(10, 10);
+    M5.Lcd.setTextColor(WHITE, BLACK);
+    M5.Lcd.print("Connecting WiFi...");
 
-void TaskAccelerator(void* pvParameters) {
-  // This FreeRTOS function ensures the loop executes exactly every 5ms
-  TickType_t xLastWakeTime = xTaskGetTickCount();
-  const TickType_t xFrequency = pdMS_TO_TICKS(5); 
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-  for (;;) {
-    // Wait until exactly 5ms have passed since the last cycle
-    vTaskDelayUntil(&xLastWakeTime, xFrequency);
-
-    // Only collect if the main loop has finished processing the last batch
-    if (!flag) {
-      featuresMemory[counter++] = (float)analogRead(A0);
-      featuresMemory[counter++] = (float)analogRead(A1);
-      featuresMemory[counter++] = (float)analogRead(A2);
-
-      if (counter >= DATA_SIZE) {
-        // Safe array copy using memcpy for speed
-        memcpy(features, featuresMemory, sizeof(featuresMemory));
-        counter = 0;
-        flag = true;
-      }
+    // 30s hard timeout — without this, a wrong password hangs the boot
+    // silently and you have no idea why MQTT never comes up.
+    const unsigned long WIFI_TIMEOUT_MS = 30000;
+    unsigned long start_ms = millis();
+    while (WiFi.status() != WL_CONNECTED) {
+        if (millis() - start_ms > WIFI_TIMEOUT_MS) {
+            M5.Lcd.println("\nWiFi FAILED (30s)");
+            return;
+        }
+        delay(500);
+        M5.Lcd.print(".");
     }
-  }
+    M5.Lcd.println(" OK");
 }
 
-// Functions
-int raw_feature_get_data(size_t offset, size_t length, float* out_ptr) {
-  memcpy(out_ptr, features + offset, length * sizeof(float));
-  return 0;
+static void mqtt_event_handler(void* handler_args, esp_event_base_t base,
+                               int32_t event_id, void* event_data) {
+    esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
+    switch ((esp_mqtt_event_id_t)event_id) {
+        case MQTT_EVENT_ERROR: {
+            M5.Lcd.fillScreen(BLACK);
+            M5.Lcd.setCursor(10, 10);
+            M5.Lcd.setTextColor(RED, BLACK);
+            M5.Lcd.println("MQTT ERROR");
+            if (event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
+                M5.Lcd.setCursor(10, 30);
+                M5.Lcd.printf("TCP sock_errno=%d", event->error_handle->esp_transport_sock_errno);
+            } else if (event->error_handle->error_type == MQTT_ERROR_TYPE_CONNECTION_REFUSED) {
+                M5.Lcd.setCursor(10, 30);
+                M5.Lcd.printf("Refused code=%d", (int)event->error_handle->connect_return_code);
+            }
+            break;
+        }
+        case MQTT_EVENT_CONNECTED:
+            mqtt_connected = true;
+            M5.Lcd.fillScreen(BLACK);
+            M5.Lcd.setCursor(10, 10);
+            M5.Lcd.setTextColor(GREEN, BLACK);
+            M5.Lcd.println("INFERENCING -> MQTT");
+            break;
+        case MQTT_EVENT_DISCONNECTED:
+            mqtt_connected = false;
+            M5.Lcd.fillScreen(BLACK);
+            M5.Lcd.setCursor(10, 10);
+            M5.Lcd.setTextColor(YELLOW, BLACK);
+            M5.Lcd.println("MQTT DISCONNECTED");
+            M5.Lcd.setCursor(10, 30);
+            M5.Lcd.print("Reconnecting...");
+            break;
+        default:
+            break;
+    }
 }
+
+/**
+ * Format the classification result as a small JSON document and publish
+ * it on MQTT_TOPIC_RESULT. No-op while the client is disconnected.
+ *
+ * Shape:
+ *   {"label":"Bicepcurl","score":0.85,"scores":{...},"timing":{...}}
+ */
+static void publish_inference_result(const ei_impulse_result_t *result) {
+    if (!mqtt_connected) {
+        return;
+    }
+
+    // Find the top class. EI doesn't guarantee order, so scan.
+    size_t top_ix = 0;
+    float top_val = result->classification[0].value;
+    for (size_t ix = 1; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
+        if (result->classification[ix].value > top_val) {
+            top_val = result->classification[ix].value;
+            top_ix = ix;
+        }
+    }
+    const char *top_label = result->classification[top_ix].label;
+
+    // Build the inner scores object first, then prepend the wrapper.
+    char scores_buf[384] = {0};
+    int  scores_len = 0;
+    for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
+        int n = snprintf(scores_buf + scores_len,
+                         sizeof(scores_buf) - scores_len,
+                         "%s\"%s\":%.4f",
+                         ix == 0 ? "" : ",",
+                         result->classification[ix].label,
+                         result->classification[ix].value);
+        if (n <= 0 || (size_t)n >= sizeof(scores_buf) - scores_len) {
+            return; // would-be-truncated; skip publish this round
+        }
+        scores_len += n;
+    }
+
+    int len = snprintf(mqttPayload, sizeof(mqttPayload),
+                       "{\"label\":\"%s\",\"score\":%.4f,"
+                       "\"scores\":{%s},"
+                       "\"timing\":{\"dsp\":%d,\"classification\":%d,\"anomaly\":%d}"
+#if EI_CLASSIFIER_HAS_ANOMALY == 1
+                       ",\"anomaly\":%.4f"
+#endif
+                       "}",
+                       top_label, top_val,
+                       scores_buf,
+                       result->timing.dsp,
+                       result->timing.classification,
+                       result->timing.anomaly
+#if EI_CLASSIFIER_HAS_ANOMALY == 1
+                       , result->anomaly
+#endif
+                       );
+
+    if (len <= 0 || (size_t)len >= sizeof(mqttPayload)) {
+        Serial.printf("WARN: MQTT payload truncated (len=%d, buf=%u)\n", len, (unsigned)sizeof(mqttPayload));
+        return;
+    }
+
+    int msg_id = esp_mqtt_client_publish(mqttClient, MQTT_TOPIC_RESULT,
+                                         mqttPayload, len, 0, 0);
+    if (msg_id < 0) {
+        Serial.println("WARN: MQTT publish returned error");
+    } else {
+        Serial.printf("MQTT -> %s (%d bytes): %s\n", MQTT_TOPIC_RESULT, len, mqttPayload);
+    }
+}
+
+#if !defined(EI_CLASSIFIER_SENSOR) || EI_CLASSIFIER_SENSOR != EI_CLASSIFIER_SENSOR_FUSION
+#error "Invalid model for current sensor. This sketch expects the FUSION model."
+#endif
